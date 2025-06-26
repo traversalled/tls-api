@@ -33,7 +33,8 @@ An API that forwards your HTTP requests using a custom TLS fingerprint.
 | `x-tls-profile`                     | 👤 TLS client profile. Available profiles: [See here](https://github.com/bogdanfinn/tls-client/blob/18abae60034c6d510a17b62c936efafdf53ebb80/profiles/profiles.go#L10) | No       | `N/A`   |
 | `x-tls-client-timeout`              | ⏱️ HTTP client timeout.                                                                                                                                                | Yes      | `30`    |
 | `x-tls-follow-redirects`            | 🔀 Follow redirects.                                                                                                                                                   | Yes      | `true`  |
-| `x-tls-force-http1`                 | 🔌 Force HTTP/1.1.                                                                                                                                                     | Yes      | `false` |
+| `x-tls-force-http1`                 | 🔌 Force HTTP/1.1.      | Yes      | `false` |
+| `x-tls-shuffle`                     | 🔌 Internally Shuffle the Header packet, not just Header Order simple true/false command
 | `x-tls-insecure-skip-verify`        | 🚫 Skip SSL certificate verification.                                                                                                                                  | Yes      | `false` |
 | `x-tls-with-random-extension-order` | 🎲 Randomize extensions order.                                                                                                                                         | Yes      | `true`  |
 | `x-tls-header-order`                | 📋 Header order. Format: String with headers key separated by commas (`,`)                                                                                             | Yes      | `N/A`   |
