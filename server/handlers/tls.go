@@ -9,10 +9,13 @@ import (
 	"github.com/brianxor/tls-api/internal/utils"
 	"github.com/gofiber/fiber/v3"
 	"io"
+	"math/rand"
 	"net/url"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
+	//srt "github.com/juzeon/spoofed-round-tripper" Srtill to asd later for akamai spoofing ect
 )
 
 var (
@@ -43,6 +46,7 @@ const (
 	tlsHeaderOrderHeaderKey              = "x-tls-header-order"
 	tlsPseudoHeaderOrderHeaderKey        = "x-tls-pseudo-header-order"
 	tlsWithRandomExtensionOrderHeaderKey = "x-tls-with-random-extension-order"
+	tlsShuffleHeadersKey                 = "x-tls-shuffle" //Shuffle of header packet itself not Just spoofing the header order
 )
 
 func HandleTlsForwardRoute(ctx fiber.Ctx) error {
@@ -73,57 +77,43 @@ type requestResponse struct {
 
 func doRequest(tlsData *tlsData) (*requestResponse, error) {
 	req, err := createRequest(tlsData)
-
 	if err != nil {
 		return nil, err
 	}
 
 	httpClient, err := buildTlsClient(tlsData)
-
 	if err != nil {
 		return nil, err
 	}
 
 	resp, err := httpClient.Do(req)
-
 	if err != nil {
 		return nil, err
 	}
 
 	body, err := utils.DecompressBody(resp)
-
 	if err != nil {
 		return nil, err
 	}
 
-	responseHeaders := getResponseHeaders(resp)
-	responseCookies := resp.Cookies()
-
-	reqResponse := &requestResponse{
+	return &requestResponse{
 		responseBody:    body,
 		responseCode:    resp.StatusCode,
-		responseHeaders: responseHeaders,
-		responseCookies: responseCookies,
-	}
-
-	return reqResponse, nil
+		responseHeaders: getResponseHeaders(resp),
+		responseCookies: resp.Cookies(),
+	}, nil
 }
 
 func createRequest(tlsData *tlsData) (*http.Request, error) {
 	var requestBodyReader io.Reader
-
 	if tlsData.requestMethod != http.MethodGet && len(tlsData.requestBody) > 0 {
 		requestBodyReader = bytes.NewReader(tlsData.requestBody)
 	}
-
 	req, err := http.NewRequest(tlsData.requestMethod, tlsData.requestUrl, requestBodyReader)
-
 	if err != nil {
 		return nil, err
 	}
-
 	setRequestHeaders(tlsData, req)
-
 	return req, nil
 }
 
@@ -135,33 +125,22 @@ func buildTlsClient(tlsData *tlsData) (tlsclient.HttpClient, error) {
 			DisableCompression: true,
 		}),
 	}
-
 	if !tlsData.tlsFollowRedirects {
 		tlsOptions = append(tlsOptions, tlsclient.WithNotFollowRedirects())
 	}
 	if tlsData.tlsWithRandomExtensionOrder {
 		tlsOptions = append(tlsOptions, tlsclient.WithRandomTLSExtensionOrder())
 	}
-
 	if tlsData.tlsForceHttp1 {
 		tlsOptions = append(tlsOptions, tlsclient.WithForceHttp1())
 	}
-
 	if tlsData.tlsInsecureSkipVerify {
 		tlsOptions = append(tlsOptions, tlsclient.WithInsecureSkipVerify())
 	}
-
 	if tlsData.tlsClientProxy != "" {
 		tlsOptions = append(tlsOptions, tlsclient.WithProxyUrl(tlsData.tlsClientProxy))
 	}
-
-	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), tlsOptions...)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return client, nil
+	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), tlsOptions...)
 }
 
 type tlsData struct {
@@ -179,11 +158,11 @@ type tlsData struct {
 	tlsInsecureSkipVerify       bool
 	tlsHeaderOrder              []string
 	tlsPseudoHeaderOrder        []string
+	tlsShuffleHeaders           bool
 }
 
 func extractTlsData(ctx fiber.Ctx) (*tlsData, error) {
 	tlsConfig := &tlsData{}
-
 	tlsExtractors := []func(ctx fiber.Ctx) error{
 		tlsConfig.extractReqUrl,
 		tlsConfig.extractReqMethod,
@@ -198,48 +177,51 @@ func extractTlsData(ctx fiber.Ctx) (*tlsData, error) {
 		tlsConfig.extractWithRandomExtensionOrder,
 		tlsConfig.extractHeaderOrder,
 		tlsConfig.extractPseudoHeaderOrder,
+		tlsConfig.extractShuffleHeaders,
 	}
-
 	for _, extractor := range tlsExtractors {
 		if err := extractor(ctx); err != nil {
 			return nil, err
 		}
 	}
-
 	return tlsConfig, nil
+}
+
+func (t *tlsData) extractShuffleHeaders(ctx fiber.Ctx) error {
+	shuffle := ctx.Get(tlsShuffleHeadersKey)
+	if shuffle == "" {
+		shuffle = "false"
+	}
+	parsed, err := strconv.ParseBool(shuffle)
+	if err != nil {
+		return fmt.Errorf("invalid shuffle header value: %s", shuffle)
+	}
+	t.tlsShuffleHeaders = parsed
+	return nil
 }
 
 func (t *tlsData) extractReqUrl(ctx fiber.Ctx) error {
 	reqUrl := ctx.Get(tlsUrlHeaderKey)
-
 	if reqUrl == "" {
 		return fmt.Errorf("no %s", tlsUrlHeaderKey)
 	}
-
 	_, err := url.Parse(reqUrl)
-
 	if err != nil {
 		return err
 	}
-
 	t.requestUrl = reqUrl
-
 	return nil
 }
 
 func (t *tlsData) extractReqMethod(ctx fiber.Ctx) error {
 	reqMethod := ctx.Get(tlsMethodHeaderKey)
-
 	if reqMethod == "" {
 		return fmt.Errorf("no %s", tlsMethodHeaderKey)
 	}
-
 	if !slices.Contains(supportedReqMethods, reqMethod) {
 		return fmt.Errorf("invalid request method: %s", reqMethod)
 	}
-
 	t.requestMethod = reqMethod
-
 	return nil
 }
 
@@ -254,239 +236,177 @@ func (t *tlsData) extractReqBody(ctx fiber.Ctx) error {
 }
 
 func (t *tlsData) extractProxy(ctx fiber.Ctx) error {
-	tlsClientProxy := ctx.Get(tlsProxyHeaderKey)
-
-	if tlsClientProxy != "" {
-		formattedTlsClientProxy, err := utils.FormatProxy(tlsClientProxy)
-
+	rawProxy := ctx.Get(tlsProxyHeaderKey)
+	if rawProxy != "" {
+		formatted, err := utils.FormatProxy(rawProxy)
 		if err != nil {
 			return err
 		}
-
-		t.tlsClientProxy = formattedTlsClientProxy
+		t.tlsClientProxy = formatted
 	}
-
 	return nil
 }
 
 func (t *tlsData) extractClientProfile(ctx fiber.Ctx) error {
-	clientProfile := ctx.Get(tlsProfileHeaderKey)
-
-	if clientProfile == "" {
+	profile := ctx.Get(tlsProfileHeaderKey)
+	if profile == "" {
 		return fmt.Errorf("no %s", tlsProfileHeaderKey)
 	}
-
-	tlsClientProfile, ok := profiles.MappedTLSClients[clientProfile]
-
+	mapped, ok := profiles.MappedTLSClients[profile]
 	if !ok {
-		return fmt.Errorf("invalid client profile: %s", clientProfile)
+		return fmt.Errorf("invalid client profile: %s", profile)
 	}
-
-	t.tlsClientProfile = tlsClientProfile
-
+	t.tlsClientProfile = mapped
 	return nil
 }
 
 func (t *tlsData) extractClientTimeout(ctx fiber.Ctx) error {
-	clientTimeout := ctx.Get(tlsClientTimeoutHeaderKey)
-
-	// Set to 30 as default value
-	if clientTimeout == "" {
-		clientTimeout = "30"
+	raw := ctx.Get(tlsClientTimeoutHeaderKey)
+	if raw == "" {
+		raw = "30"
 	}
-
-	tlsClientTimeout, err := strconv.Atoi(clientTimeout)
-
+	parsed, err := strconv.Atoi(raw)
 	if err != nil {
-		return fmt.Errorf("invalid client timeout: %s", clientTimeout)
+		return fmt.Errorf("invalid client timeout: %s", raw)
 	}
-
-	t.tlsClientTimeout = tlsClientTimeout
-
+	t.tlsClientTimeout = parsed
 	return nil
 }
 
 func (t *tlsData) extractFollowRedirects(ctx fiber.Ctx) error {
-	followRedirects := ctx.Get(tlsFollowRedirectsHeaderKey)
-
-	// Set to true as default value
-	if followRedirects == "" {
-		followRedirects = "true"
+	raw := ctx.Get(tlsFollowRedirectsHeaderKey)
+	if raw == "" {
+		raw = "true"
 	}
-
-	tlsFollowRedirects, err := strconv.ParseBool(followRedirects)
-
+	parsed, err := strconv.ParseBool(raw)
 	if err != nil {
-		return fmt.Errorf("invalid follow redirects: %s", followRedirects)
+		return fmt.Errorf("invalid follow redirects: %s", raw)
 	}
-
-	t.tlsFollowRedirects = tlsFollowRedirects
-
+	t.tlsFollowRedirects = parsed
 	return nil
 }
 
 func (t *tlsData) extractForceHttp1(ctx fiber.Ctx) error {
-	forceHttp1 := ctx.Get(tlsForceHttp1HeaderKey)
-
-	// Set to false as default value
-	if forceHttp1 == "" {
-		forceHttp1 = "false"
+	raw := ctx.Get(tlsForceHttp1HeaderKey)
+	if raw == "" {
+		raw = "false"
 	}
-
-	tlsForceHttp1, err := strconv.ParseBool(forceHttp1)
-
+	parsed, err := strconv.ParseBool(raw)
 	if err != nil {
-		return fmt.Errorf("invalid force http1: %s", forceHttp1)
+		return fmt.Errorf("invalid force http1: %s", raw)
 	}
-
-	t.tlsForceHttp1 = tlsForceHttp1
-
+	t.tlsForceHttp1 = parsed
 	return nil
 }
 
 func (t *tlsData) extractInsecureSkipVerify(ctx fiber.Ctx) error {
-	insecureSkipVerify := ctx.Get(tlsInsecureSkipVerifyHeaderKey)
-
-	// Set to false as default value
-	if insecureSkipVerify == "" {
-		insecureSkipVerify = "false"
+	raw := ctx.Get(tlsInsecureSkipVerifyHeaderKey)
+	if raw == "" {
+		raw = "false"
 	}
-
-	tlsInsecureSkipVerify, err := strconv.ParseBool(insecureSkipVerify)
-
+	parsed, err := strconv.ParseBool(raw)
 	if err != nil {
-		return fmt.Errorf("invalid insecure skip verify: %s", insecureSkipVerify)
+		return fmt.Errorf("invalid insecure skip verify: %s", raw)
 	}
-
-	t.tlsInsecureSkipVerify = tlsInsecureSkipVerify
-
+	t.tlsInsecureSkipVerify = parsed
 	return nil
 }
 
 func (t *tlsData) extractWithRandomExtensionOrder(ctx fiber.Ctx) error {
-	withRandomExtensionOrder := ctx.Get(tlsWithRandomExtensionOrderHeaderKey)
-
-	// Set to true as default value
-	if withRandomExtensionOrder == "" {
-		withRandomExtensionOrder = "true"
+	raw := ctx.Get(tlsWithRandomExtensionOrderHeaderKey)
+	if raw == "" {
+		raw = "true"
 	}
-
-	tlsWithRandomExtensionOrder, err := strconv.ParseBool(withRandomExtensionOrder)
-
+	parsed, err := strconv.ParseBool(raw)
 	if err != nil {
-		return fmt.Errorf("invalid random extension order: %s", withRandomExtensionOrder)
+		return fmt.Errorf("invalid random extension order: %s", raw)
 	}
-
-	t.tlsWithRandomExtensionOrder = tlsWithRandomExtensionOrder
-
-	return err
+	t.tlsWithRandomExtensionOrder = parsed
+	return nil
 }
 
 func (t *tlsData) extractHeaderOrder(ctx fiber.Ctx) error {
-	headerOrder := ctx.Get(tlsHeaderOrderHeaderKey)
-
-	if headerOrder == "" {
+	raw := ctx.Get(tlsHeaderOrderHeaderKey)
+	if raw == "" {
 		return fmt.Errorf("no %s", tlsHeaderOrderHeaderKey)
 	}
-
-	headerOrder = strings.ReplaceAll(headerOrder, " ", "")
-
-	headerOrderItems := strings.Split(headerOrder, ",")
-
-	if len(headerOrderItems) == 0 {
-		return fmt.Errorf("invalid header order: %s", headerOrder)
+	parts := strings.Split(strings.ReplaceAll(raw, " ", ""), ",")
+	if len(parts) == 0 {
+		return fmt.Errorf("invalid header order: %s", raw)
 	}
-
-	t.tlsHeaderOrder = headerOrderItems
-
+	t.tlsHeaderOrder = parts
 	return nil
 }
 
 func (t *tlsData) extractPseudoHeaderOrder(ctx fiber.Ctx) error {
-	pseudoHeaderOrder := ctx.Get(tlsPseudoHeaderOrderHeaderKey)
-
-	if pseudoHeaderOrder == "" {
+	raw := ctx.Get(tlsPseudoHeaderOrderHeaderKey)
+	if raw == "" {
 		return fmt.Errorf("no %s", tlsPseudoHeaderOrderHeaderKey)
 	}
-
-	pseudoHeaderOrder = strings.ReplaceAll(pseudoHeaderOrder, " ", "")
-
-	pseudoHeaderOrderItems := strings.Split(pseudoHeaderOrder, ",")
-
-	if len(pseudoHeaderOrderItems) == 0 {
-		return fmt.Errorf("invalid pseudo header order: %s", pseudoHeaderOrder)
+	parts := strings.Split(strings.ReplaceAll(raw, " ", ""), ",")
+	if len(parts) == 0 {
+		return fmt.Errorf("invalid pseudo header order: %s", raw)
 	}
-
-	t.tlsPseudoHeaderOrder = pseudoHeaderOrderItems
-
+	t.tlsPseudoHeaderOrder = parts
 	return nil
 }
 
 func setRequestHeaders(tlsData *tlsData, req *http.Request) {
-	for headerKey, headerValues := range tlsData.requestHeaders {
-		headerKeyLower := strings.ToLower(headerKey)
-
-		isContentType := headerKeyLower == "content-type" && slices.Contains(methodsWithoutRequestBody, tlsData.requestMethod)
-		isContentLength := headerKeyLower == "content-length"
-		isTlsHeader := strings.HasPrefix(headerKeyLower, "x-tls")
-
-		if isContentType || isContentLength || isTlsHeader {
+	var headerPairs [][2]string
+	for key, values := range tlsData.requestHeaders {
+		lkey := strings.ToLower(key)
+		if strings.HasPrefix(lkey, "x-tls") || lkey == "content-length" || (lkey == "content-type" && slices.Contains(methodsWithoutRequestBody, tlsData.requestMethod)) {
 			continue
 		}
-
-		for _, value := range headerValues {
-			req.Header.Set(headerKey, value)
+		for _, val := range values {
+			headerPairs = append(headerPairs, [2]string{key, val})
 		}
 	}
-
+	if tlsData.tlsShuffleHeaders {
+		rand.Seed(time.Now().UnixNano())
+		rand.Shuffle(len(headerPairs), func(i, j int) {
+			headerPairs[i], headerPairs[j] = headerPairs[j], headerPairs[i]
+		})
+	}
+	for _, pair := range headerPairs {
+		req.Header.Set(pair[0], pair[1])
+	}
 	req.Header[http.HeaderOrderKey] = tlsData.tlsHeaderOrder
 	req.Header[http.PHeaderOrderKey] = tlsData.tlsPseudoHeaderOrder
 }
 
 func getResponseHeaders(resp *http.Response) map[string]string {
-	responseHeaders := make(map[string]string)
-
-	for key, values := range resp.Header {
-		for _, value := range values {
-			if key != "Content-Length" && key != "Content-Encoding" {
-				responseHeaders[key] = value
-			}
+	headers := make(map[string]string)
+	for k, v := range resp.Header {
+		if k != "Content-Length" && k != "Content-Encoding" {
+			headers[k] = v[0]
 		}
 	}
-
-	return responseHeaders
+	return headers
 }
 
 func setResponseHeaders(ctx fiber.Ctx, reqResponse *requestResponse) {
 	for key := range ctx.GetRespHeaders() {
 		ctx.Response().Header.Del(key)
 	}
-
-	if len(reqResponse.responseHeaders) > 0 {
-		for key, value := range reqResponse.responseHeaders {
-			ctx.Set(key, value)
-		}
+	for key, value := range reqResponse.responseHeaders {
+		ctx.Set(key, value)
 	}
 }
 
 func setResponseCookies(ctx fiber.Ctx, reqResponse *requestResponse) {
-	if len(reqResponse.responseCookies) > 0 {
-		for _, cookie := range reqResponse.responseCookies {
-			fiberCookie := &fiber.Cookie{
-				Name:     cookie.Name,
-				Value:    cookie.Value,
-				Path:     cookie.Path,
-				Domain:   cookie.Domain,
-				MaxAge:   cookie.MaxAge,
-				Expires:  cookie.Expires,
-				Secure:   cookie.Secure,
-				HTTPOnly: cookie.HttpOnly,
-			}
-
-			fiberCookie.SameSite = utils.TranslateSameSite(cookie.SameSite)
-
-			ctx.Cookie(fiberCookie)
-		}
+	for _, c := range reqResponse.responseCookies {
+		ctx.Cookie(&fiber.Cookie{
+			Name:     c.Name,
+			Value:    c.Value,
+			Path:     c.Path,
+			Domain:   c.Domain,
+			MaxAge:   c.MaxAge,
+			Expires:  c.Expires,
+			Secure:   c.Secure,
+			HTTPOnly: c.HttpOnly,
+			SameSite: utils.TranslateSameSite(c.SameSite),
+		})
 	}
 }
 
